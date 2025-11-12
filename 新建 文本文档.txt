@@ -1,0 +1,4 @@
+api: fXq2hBqM65GDltn7izP08EO7eHqAVDcC
+bot_id: 7527195965674047003
+
+python3 chat_completion_apikey.py --bot_id <bot_id> --api_key <api_key>
