@@ -1,100 +1,77 @@
-# AskEcho Excel 批处理智能体
+﻿# AskEcho Excel 批处理脚本
 
-## 项目简介
-- 通过调用大语言模型，对 Excel 中的多行数据进行批量处理（问答、摘要、改写、结构化等），并将结果写回到 Excel。
-- 使用基于 API Key 的对话补全接口（Chat Completions）。
-- 示例工作簿：`测试.xlsx`。
+`batch_excel_agent.py` 用于批量读取 Excel 中的每一条问题，调用 Feedcoop Agent Chat Completion 接口生成回答，并把答案和“首帧返回时间”(first-token latency) 写回到 Excel 中，方便对大模型的响应速度与输出质量做统一评估。
 
-## 目录结构
-- `batch_excel_agent.py`：批量读取与写回 Excel 的主脚本。
-- `chat_completion_apikey.py`：以 API Key 调用聊天模型的封装。
-- `chat_completion_aksk.py`（如存在）：替代鉴权方式示例。
-- `测试.xlsx`：示例输入文件。
-- `requirements.txt`：依赖列表。
+## 功能特性
+- **流式推理**：使用 SSE 流式接口，在接收到第一段内容时立即记录首帧耗时。
+- **列位灵活**：问题、答案、首帧耗时列均可配置，未指定耗时列时自动写在答案列右侧。
+- **错误回写**：连续重试失败后，会在答案列写入 `[ERROR] ...` 以便排查。
+- **限速与重试**：支持请求间隔、最大重试次数、重试等待间隔等参数，便于规避限流。
 
-## 环境要求
+## 依赖环境
 - Python 3.9+
-- 建议使用虚拟环境（venv 或 conda）
+- `requests`, `openpyxl`
 
-## 快速开始
-1) 克隆与进入项目
-```
-git clone <你的仓库地址>
-cd askecho_demo
-```
-
-2) 创建并激活虚拟环境（Windows PowerShell）
-```
+建议使用虚拟环境：
+```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-3) 安装依赖
-```
 pip install -r requirements.txt
 ```
 
-4) 配置 API Key（至少其一）
-- 临时（当前终端会话）：
+## 快速开始
+```powershell
+python batch_excel_agent.py \
+  --bot-id <BOT_ID> \
+  --api-key <API_KEY> \
+  --input 输入.xlsx \
+  --output 输出.xlsx \
+  --question-column A \
+  --answer-column B \
+  --latency-column C
 ```
-$env:OPENAI_API_KEY="<你的_api_key>"
-```
-- 或在系统环境变量中永久配置；若项目支持 `.env`，也可写入：
-```
-OPENAI_API_KEY=<你的_api_key>
-```
+若不指定 `--output`，会自动写入 `<输入名>_processed.xlsx`；若省略 `--latency-column`，默认把耗时写在答案列右侧。
 
-5) 准备 Excel 输入
-- 使用仓库内 `测试.xlsx`，或替换为你自己的文件。
-- 确认列名与脚本读取的一致（例如：问题列、输出列、工作表名等）。
+## CLI 参数
+| 参数 | 说明 | 默认值 |
+| --- | --- | --- |
+| `--bot-id` | Feedcoop 机器人 ID | 必填 |
+| `--api-key` | Feedcoop API Key (Bearer) | 必填 |
+| `--input` | 输入 Excel 路径 | 必填 |
+| `--output` | 输出 Excel 路径 | `<输入名>_processed.xlsx` |
+| `--sheet-name` | 要处理的 Sheet 名称 | 工作簿当前激活表 |
+| `--question-column` | 问题列（字母） | `A` |
+| `--answer-column` | 答案列（字母） | `B` |
+| `--latency-column` | 首帧耗时列（秒），可不填 | 答案列的右侧一列 |
+| `--start-row` | 起始行号 | `2` |
+| `--skip-completed` | 若答案列已有内容则跳过 | 关闭 |
+| `--request-interval` | 每次调用后的等待秒数 | `0.2` |
+| `--max-retries` | 失败重试次数（>=1） | `3` |
+| `--retry-wait` | 重试前的等待秒数 | `2.0` |
+| `--temperature` | 传给模型的 temperature | 不设置 |
+| `--timeout` | HTTP 请求超时时间（秒） | `60` |
 
-## 使用方法
-> 注意：以下参数为常见示例，占位请按你脚本的实际参数名调整。
+## 工作流程
+1. 打开输入工作簿，定位到指定列与起始行。
+2. 若 `--skip-completed` 开启且答案列已有内容，则跳过该行。
+3. 通过 `AgentClient` 调用 Feedcoop API：
+   - 以流式方式逐行读取 `data:` 事件；
+   - 接到第一段内容时记录 `time.perf_counter()` 计算首帧耗时；
+   - 拼接所有增量片段形成完整回答。
+4. 成功则把答案和首帧耗时（秒，保留三位小数）写回相应列。
+5. 失败会重试；重试仍失败则把错误写入答案列，耗时列清空。
+6. 所有行处理完毕后保存到输出路径，并打印“已处理/跳过/失败”统计。
 
-- 基本运行：
-```
-python batch_excel_agent.py --input 测试.xlsx --output 结果.xlsx
-```
-
-- 常见参数：
-- `--sheet`：输入工作表名称（默认首个工作表）
-- `--model`：模型名称（如 `gpt-4o-mini`）
-- `--prompt`：提示词模板（系统/用户提示）
-- `--col-in`：输入列名（如 `问题`）
-- `--col-out`：输出列名（如 `回答`）
-
-- 示例：
-```
-python batch_excel_agent.py --input 测试.xlsx --col-in 问题 --col-out 回答 --output 结果.xlsx --model gpt-4o-mini
-```
-
-## 环境变量
-- 必需：
-  - `OPENAI_API_KEY`：对话模型的 API Key
-- 可选：
-  - `OPENAI_API_BASE`：自定义 API Base（代理或兼容服务时使用）
-  - 其他与提供商相关的变量，视 `chat_completion_apikey.py` 支持而定
+## 输出格式
+- **答案列**：模型完整输出；失败时为 `[ERROR] ...`。
+- **首帧耗时列**：首帧到达耗时（秒），示例 `0.742`；若未收到内容则为空。
 
 ## 常见问题
-- 首次使用 SSH 推送到 GitHub 出现主机指纹确认：
-  - 输入 `yes` 即可，指纹会被写入 `~/.ssh/known_hosts`。
-- 推送报错 “Permission denied (publickey)”：
-  - 将远程改为 HTTPS，或正确生成/添加 SSH Key 到 GitHub。
-- Windows 出现 CRLF/LF 警告：
-  - 正常提示。若需统一行尾，可在仓库根添加 `.gitattributes`：`* text=auto eol=lf`，然后执行 `git add --renormalize .`。
-- Excel 文件被占用导致读写失败：
-  - 先关闭已打开的 Excel 文件后再运行脚本。
-- API 报错或耗时较长：
-  - 检查 `OPENAI_API_KEY`、网络可达性、模型名称与 API Base；酌情增加重试与超时设置。
+- **Excel 正在占用**：确保 Excel 文件未被桌面程序打开，否则 `openpyxl` 无法写入。
+- **HTTP 报错/invalid_request**：检查 Bot ID、API Key、网络及代理；必要时增大 `--timeout`。
+- **频繁超时**：适当调大 `--request-interval`、`--retry-wait`，或减少同时运行的任务。
 
-## 开发计划（可选）
-- 增加重试与退避策略，提升稳健性。
-- 增加进度条与日志输出。
-- 支持按行动态提示词模板与并发限速控制。
-
-## 许可
-- 请根据实际选择并补充许可证（例如 MIT）。
-
-## 贡献
-- 欢迎提交 Issue 或 Pull Request。建议附最小可复现的示例 Excel 与复现步骤。
-
+## 实用建议
+- 先在少量行上试跑确认列名、Sheet、起始行设置正确。
+- 若要记录更多指标，可在 Excel 中预留额外列，或在脚本中扩展写入逻辑。
+- 建议结合版本控制跟踪输出文件，方便对比不同 prompt 或模型的效果与耗时。

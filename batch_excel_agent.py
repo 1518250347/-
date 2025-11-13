@@ -8,7 +8,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import requests
 from openpyxl import load_workbook
@@ -35,8 +35,13 @@ class AgentClient:
         self.timeout = timeout
         self.session = requests.Session()  # Reuse TCP connections across rows
 
-    def complete(self, question: str, temperature: Optional[float] = None) -> str:
-        """Send one question to the agent and return the streamed answer."""
+    def complete(
+        self, question: str, temperature: Optional[float] = None
+    ) -> Tuple[str, Optional[float]]:
+        """
+        Send one question to the agent and return (answer, 首帧耗时秒).
+        首帧耗时为请求发起到收到第一段内容之间的时间，若未观测到内容则为 None。
+        """
         if not question:
             raise ValueError("问题内容为空")
         body = {
@@ -48,13 +53,17 @@ class AgentClient:
             body["temperature"] = temperature
         return self._post(body)
 
-    def _post(self, body: dict) -> str:
-        """Perform the streaming POST request and stitch together all chunks."""
+    def _post(self, body: dict) -> Tuple[str, Optional[float]]:
+        """
+        Perform the streaming POST request, stitch together all chunks, and
+        measure the first-token latency (seconds).
+        """
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": CONTENT_TYPE,
         }
         url = f"https://{HOST}{PATH}"
+        start_time = time.perf_counter()
         with self.session.post(
             url, json=body, headers=headers, timeout=self.timeout, stream=True
         ) as resp:
@@ -62,6 +71,7 @@ class AgentClient:
                 raise AgentAPIError(f"HTTP {resp.status_code}: {resp.text[:200]}")
 
             chunks = []
+            first_chunk_time: Optional[float] = None
             for line in resp.iter_lines():
                 if not line:
                     continue
@@ -83,11 +93,16 @@ class AgentClient:
                 delta = payload["choices"][0].get("delta", {})
                 content = delta.get("content")
                 if content:
+                    if first_chunk_time is None:
+                        first_chunk_time = time.perf_counter()
                     chunks.append(content)
 
             if not chunks:
                 raise AgentAPIError("未收到有效内容")
-            return "".join(chunks).strip()
+            latency = (
+                first_chunk_time - start_time if first_chunk_time is not None else None
+            )
+            return "".join(chunks).strip(), latency
 
 
 def process_workbook(
@@ -103,16 +118,21 @@ def process_workbook(
     max_retries: int,
     retry_wait: float,
     temperature: Optional[float],
+    latency_column: Optional[str],
 ) -> dict:
     """
     Iterate over the worksheet, send each question to the agent, write answers back,
-    and return counters summarizing the batch run.
+    store first-token latency metrics, and return counters summarizing the batch run.
     """
     wb = load_workbook(input_path, data_only=True)
     ws = wb[sheet_name] if sheet_name else wb.active
 
     question_col_idx = column_index_from_string(question_column.upper())
     answer_col_idx = column_index_from_string(answer_column.upper())
+    if latency_column:
+        latency_col_idx = column_index_from_string(latency_column.upper())
+    else:
+        latency_col_idx = answer_col_idx + 1  # 默认写入答案列的下一列
 
     processed = skipped = failures = 0
     max_row = ws.max_row
@@ -130,13 +150,17 @@ def process_workbook(
             skipped += 1
             continue  # Respect existing answers
 
+        latency_cell = ws.cell(row=row, column=latency_col_idx)
         success = False
         last_error: Optional[Exception] = None
 
         for attempt in range(1, max_retries + 1):
             try:
-                answer = client.complete(question_text, temperature)
+                answer, latency = client.complete(question_text, temperature)
                 answer_cell.value = answer
+                latency_cell.value = (
+                    round(latency, 3) if latency is not None else None
+                )
                 processed += 1
                 success = True
                 print(f"[OK] Row {row} processed.")
@@ -154,6 +178,7 @@ def process_workbook(
         if not success:
             failures += 1
             answer_cell.value = f"[ERROR] {last_error}"
+            latency_cell.value = None
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
@@ -178,6 +203,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sheet-name", help="要处理的 Sheet 名称（默认激活工作表）")
     parser.add_argument("--question-column", default="A", help="问题所在列，默认 A")
     parser.add_argument("--answer-column", default="B", help="答案输出列，默认 B")
+    parser.add_argument(
+        "--latency-column",
+        help="首帧返回时间写入的列（默认写在答案列右侧）",
+    )
     parser.add_argument("--start-row", type=int, default=2, help="起始行，默认 2")
     parser.add_argument(
         "--skip-completed",
@@ -238,6 +267,7 @@ def main() -> None:
         max_retries=max(1, args.max_retries),
         retry_wait=args.retry_wait,
         temperature=args.temperature,
+        latency_column=args.latency_column,
     )
 
     print(
